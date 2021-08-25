@@ -1,0 +1,781 @@
+---
+title: "CETP Analysis"
+output: 
+  html_document: 
+    code_folding: show
+---
+
+This document contains code for the analysis of the effect of CETP variant 16_57004947 on HDL and LDL levels among Polynesians living in Aotearoa New Zealand.
+
+First, libraries and functions are loaded in.
+
+```{r setup, message = F, warning = F, cache = T}
+# Loading in required libraries
+library(vroom)
+library(GMMAT)
+library(rsq)
+library(HardyWeinberg)
+library(plyr)
+library(kableExtra)
+library(meta)
+library(car)
+library(ggpubr)
+library(tidyverse)
+
+setwd("/Volumes/userdata/staff_groups/merrimanlab/Merriman_Documents/Megan/CETP_paper/clean_rmd/")
+
+#library(pander)
+#library(xtable)
+#library(knitr) 
+#library(broom)
+#library(bReakingbad)
+
+# Loading in functions
+meansd <- function(characteristic){ 
+  a <- round(mean(as.numeric(characteristic), na.rm = TRUE), 2)
+  b <- round(sd(as.numeric(characteristic), na.rm = TRUE), 2)
+  return(paste0(a, " \u00b1 ", b))
+}
+
+npercent <- function(characteristic, name){
+  # characteristic is df$column and name is variable from that column in quote marks eg npercent(UKbiobank_goutSE_EURO$SEX,"1")
+  a <- table(characteristic)[[name]]
+  total <- sum(table(characteristic)) - sum(is.na(characteristic))
+  percent <- round(a / total * 100, 2)
+  return(paste0(a, " (", percent, ")"))
+}
+
+hwepval <- function(snpcol, gt1, gt2, gt3){
+  # snpcol = column with alleles coded as bases. gt1-3 are the genotypes 
+  # example = hwepval(mydata$ABCC5_RS369277426,"CC","CT","TT")
+  t <- HWExact(table(factor(snpcol, levels = c(gt1, gt2, gt3))), verbose = F)
+  p <- t[["pval"]]
+  return(paste(p))
+}
+
+# Function to highlight significant p-values in tables
+format_p <- function(p){
+  ifelse(as.numeric(p) < 0.05, cell_spec(p, "html", bold = T), cell_spec(p, "html",  bold = F))
+}
+
+# Creating the function that will use the glm function to fill in the results table
+results <- function(test, genotypes, s){
+  matrixoutput <- matrix(nrow = 1, ncol = 7)
+  matrixoutput[1] <- test$df.null + 1
+  matrixoutput[2] <- paste0(genotypes, collapse = "/")
+  matrixoutput[3] <- paste0(s, collapse = "/")
+  matrixoutput[4] <- sprintf(fmt = "%.3f", coefficients(test)[2]) # beta
+  matrixoutput[5] <- sprintf(fmt = "%.3f", coef(summary(test))[2, 2]) # SE
+  matrixoutput[6] <- sprintf(fmt = "%.3f", exp(coefficients(test))[2]) # OR
+  matrixoutput[7] <- sprintf(fmt = "%.3f", exp(confint(test))[2, 1]) # LCI
+  matrixoutput[8] <- sprintf(fmt = "%.3f", exp(confint(test))[2, 2]) # UCI
+  matrixoutput[9] <- sprintf(fmt = "%.3f", coef(summary(test))[2, 4]) # p value
+  return(matrixoutput)
+}
+```
+
+Next, datasets are loaded in and transformed to be ready for analysis.
+
+```{r dataprep, message = F, warning = F, cache = T}
+# Import the SNPMAX files with HDL, LDL and genotype and fix any duplicate participants
+
+# There is a stupid thing here where we have to specify the column types so that it doesn't assume that the first 1000 rows are what to expect, this is an issue for the GT file
+# Also fixed the RD and DM problem when you download from SNPMAX using the string detect function
+CETP_DM <- read_delim(file = "CETP_DM", delim = "\t", col_types = "ccccccccnnc") %>% mutate(COHORT = "DM") %>% filter(str_detect(SUBJECT, pattern = "DM"))
+CETP_RD <- read_delim(file = "CETP_RD", delim = "\t", col_types = "ccccccccnnc") %>% mutate(COHORT = "RD") %>% filter(str_detect(SUBJECT, pattern = "RD"))
+CETP_GT <- read_delim(file = "CETP_GT_new", delim = "\t", col_types = "ccccccccnnc") %>% mutate(COHORT = "GT")
+CETP_NPH <- read_delim(file = "NPH_CETP", delim = "\t", col_types = "ccccccccnnc") %>% mutate(COHORT = "NPH")
+CETP_PTO <- read_delim(file = "CETP_PTO1.txt", delim = "\t", col_types = "ccccccccnncnnnnnnnnnnn") %>% mutate(COHORT = "PTO")
+
+names(CETP_PTO)[1] <- "Pheno.SampleID"
+CETP_PTO <- CETP_PTO %>% filter(!is.na(`16_57004947`))
+
+# Filtering out non-Polynesians
+tmp <- readxl::read_xlsx("PTO_AnalysisFile_UseFinalNOV.xlsx") %>% select(PATIENT, ETHNICITY) %>% filter(str_detect(ETHNICITY, "Tongan|Samoan|Tokelauan|CI Maori|NZ Maori|Tahitian|Hawaiian|Tuvaluan|Niuean"))
+
+CETP_PTO_Poly <- CETP_PTO %>% filter(Pheno.SampleID %in% tmp$PATIENT)
+
+CETP_PTO_NonPoly <- CETP_PTO %>% filter(!(Pheno.SampleID %in% tmp$PATIENT))
+
+# Checking that we fixed the 1000 row problem
+#table(CETP_DM$`16_57004947`)
+#table(CETP_RD$`16_57004947`)
+#table(CETP_GT$`16_57004947`)
+#table(CETP_NPH$`16_57004947`)
+
+all_CETP_pheno <- rbind(CETP_NPH, CETP_RD, CETP_DM, CETP_GT)
+
+# First get rid of anyone who doesn't have a genotype
+
+all_CETP_pheno <- all_CETP_pheno %>% filter(!is.na(`16_57004947`))
+
+# Now remove exact duplicates 
+
+test <- all_CETP_pheno %>% filter(duplicated(SUBJECT))
+test2 <- all_CETP_pheno %>% filter(SUBJECT %in% test$SUBJECT) # 4 individuals were duplicated between gout and NPH
+
+tmp <- all_CETP_pheno %>% filter(!(SUBJECT %in% test$SUBJECT))
+all_CETP_pheno <- rbind(tmp, test)
+
+# Removing IDs that appear in alt ID column (dupes across cohorts)
+all_CETP_pheno <- all_CETP_pheno %>% filter(!(ALTID %in% SUBJECT))
+
+# Label rows and columns with IDs from PLINK FAM file
+fam_file <- read_delim("CZ-MB1.2-QC1.10_CoreExome24-1.0-3_genotyped-QCd_rsIDconverted.fam", delim = " ", col_names = F)
+
+filter_fam <- fam_file %>% filter(X2 %in% all_CETP_pheno$SUBJECT)
+
+filter_pheno <- all_CETP_pheno %>% filter(SUBJECT %in% filter_fam$X2, !is.na(HDL))
+
+coreex_pheno <- read_delim("CZ-MB1.2-QC1.10_MergedPhenotypes_20082020.txt", delim = "\t") %>% 
+  filter(Pheno.SampleID %in% filter_pheno$SUBJECT,
+         Pheno.SpecificEthnicity != "European")
+
+tmp <- coreex_pheno %>% filter(duplicated(Pheno.SampleID))
+tmp2 <- coreex_pheno %>% filter(Pheno.SampleID %in% tmp$Pheno.SampleID)
+
+not_duped <- coreex_pheno %>% filter(!(Pheno.SampleID %in% tmp$Pheno.SampleID))
+
+# Subsetting into island groups
+#table(coreex_pheno$Pheno.SpecificEthnicity)
+#table(coreex_pheno$Geno.BroadAncestry)
+#table(coreex_pheno$Geno.SpecificAncestry)
+#table(coreex_pheno$Geno.IslandGroup)
+
+allpoly <- not_duped %>% select(Pheno.SampleID, Pheno.Gender, Pheno.Age, Pheno.SpecificEthnicity, Geno.SampleID, Geno.PCVector1:Geno.PCVector10, Geno.PCVector1_Oc:Geno.PCVector10_Oc, Pheno.Study, Pheno.GoutSummary, Pheno.Height, Pheno.Weight, Pheno.BMI)
+
+#table(allpoly$Pheno.Study)
+
+hdl_pheno <- all_CETP_pheno %>% select(SUBJECT, HDL, LDL, `16_57004947`, COHORT)
+
+allpoly <- allpoly %>% left_join(hdl_pheno, by = c("Pheno.SampleID" = "SUBJECT"))
+
+allpoly <- allpoly %>% mutate(Pheno.Gender = as.factor(Pheno.Gender), Pheno.SpecificEthnicity = as.factor(Pheno.SpecificEthnicity), `16_57004947` = as.factor(`16_57004947`), X16_57004947_down = as.numeric(as.character(mapvalues(`16_57004947`, c("TT", "CT", "CC"), c("2", "1", "0")))))
+
+CETP_PTO_Poly <- CETP_PTO_Poly %>% mutate(X16_57004947_down = as.numeric(as.character(mapvalues(`16_57004947`, c("TT", "CT", "CC"), c("2", "1", "0")))))
+
+CETP_PTO_NonPoly <- CETP_PTO_NonPoly %>% mutate(X16_57004947_down = as.numeric(as.character(mapvalues(`16_57004947`, c("TT", "CT", "CC"), c("2", "1", "0")))),
+                                                `16_57004947` = factor(`16_57004947`, levels = c("CC", "CT", "TT")))
+
+
+NPH <- allpoly %>% filter(COHORT == "NPH")
+NZ_Maori <- allpoly %>% filter(COHORT != "NPH", Pheno.SpecificEthnicity == "NZ Maori")
+Other_Polynesian <- allpoly %>% filter(COHORT != "NPH", Pheno.SpecificEthnicity %in% c("Other Polynesian", "French Polynesian", "Tuvaluan"))
+Samoan <- allpoly %>% filter(COHORT != "NPH", Pheno.SpecificEthnicity == "Samoan")
+Niuean <- allpoly %>% filter(COHORT != "NPH", Pheno.SpecificEthnicity == "Niuean")
+CIMaori <- allpoly %>% filter(COHORT != "NPH", Pheno.SpecificEthnicity == "CI Maori")
+Tongan <- allpoly %>% filter(COHORT != "NPH", Pheno.SpecificEthnicity == "Tongan")
+Pukapukan <- allpoly %>% filter(COHORT != "NPH", Pheno.SpecificEthnicity == "Pukapukan")
+
+write_delim(allpoly, file = "allpoly.pheno.txt", delim = "\t")
+
+# Cleaning up
+rm(CETP_DM, CETP_GT, CETP_NPH, CETP_RD, CETP_PTO, test, test2, tmp, tmp2, not_duped, all_CETP_pheno, coreex_pheno, fam_file, filter_fam, filter_pheno, hdl_pheno)
+```
+
+Now, demographics are read in from another file and a table is produced summarising the demographics of each cohort.
+
+```{r Demographics, message = F, warning = F, cache = T}
+# Loading in demographic data from Sequenom file
+allpoly <- read_delim("allpoly.pheno.txt", delim = "\t")
+demo <- read_delim(file = "sequenom_master_wo_dups_w_NPH.txt", delim = "\t") %>% select(-HDL, -LDL)
+names(demo)[1] <- "Pheno.SampleID"
+allpoly_demos <- left_join(allpoly, demo, by = "Pheno.SampleID")
+
+NPH1 <- allpoly_demos %>% filter(COHORT == "NPH")
+NZ_Maori1 <- allpoly_demos %>% filter(COHORT != "NPH", Pheno.SpecificEthnicity == "NZ Maori")
+Other_Polynesian1 <- allpoly_demos %>% filter(COHORT != "NPH", Pheno.SpecificEthnicity %in% c("Other Polynesian", "French Polynesian", "Tuvaluan"))
+Samoan1 <- allpoly_demos %>% filter(COHORT != "NPH", Pheno.SpecificEthnicity == "Samoan")
+Niuean1 <- allpoly_demos %>% filter(COHORT != "NPH", Pheno.SpecificEthnicity == "Niuean")
+CIMaori1 <- allpoly_demos %>% filter(COHORT != "NPH", Pheno.SpecificEthnicity == "CI Maori")
+Tongan1 <- allpoly_demos %>% filter(COHORT != "NPH", Pheno.SpecificEthnicity == "Tongan")
+Pukapukan1 <- allpoly_demos %>% filter(COHORT != "NPH", Pheno.SpecificEthnicity == "Pukapukan")
+
+# DEMOGRAPHIC TABLE 
+clinical_table <- function(datasetx) {
+  tab <- datasetx %>% 
+    select(Pheno.SampleID, Pheno.Gender, Pheno.Age, Pheno.Height, Pheno.Weight, Pheno.BMI, LDL, HDL, Pheno.GoutSummary, DIABETES) %>% 
+    dplyr::summarise(n = NROW(Pheno.SampleID),
+                     sex = npercent(Pheno.Gender, "Male"),
+                     age1 = paste0(range(Pheno.Age, na.rm = T), collapse = " - "),
+                     age2 = meansd(Pheno.Age),
+                     height = meansd(Pheno.Height),
+                     weight = meansd(Pheno.Weight),
+                     BMI = meansd(Pheno.BMI),
+                     LDL = meansd(LDL),
+                     HDL = meansd(HDL),
+                     Gout = npercent(Pheno.GoutSummary, "Gout"),
+                     Diabetes = npercent(DIABETES, "2")) %>% data.frame()
+  return(as.data.frame(tab))
+}
+
+tmp <- allpoly_demos %>% filter(COHORT != "NPH")
+allpoly_demos1 <- clinical_table(tmp)
+NPH2 <- clinical_table(NPH1)
+NZ_Maori2 <- clinical_table(NZ_Maori1)
+Other_Polynesian2 <- clinical_table(Other_Polynesian1)
+Samoan2 <- clinical_table(Samoan1)
+Niuean2 <- clinical_table(Niuean1)
+CIMaori2 <- clinical_table(CIMaori1)
+Tongan2 <- clinical_table(Tongan1)
+Pukapukan2 <- clinical_table(Pukapukan1)
+
+# PTO DEMOGRAPHIC TABLE 
+clinical_table2 <- function(datasetx) {
+  tab <- datasetx %>%
+    select(Pheno.SampleID, SEX, AGECOL, HEIGHT, WEIGHT, BMI, WAIST, LDL, HDL) %>% 
+    dplyr::summarise(n = NROW(Pheno.SampleID),
+                     sex = npercent(SEX, "1"),
+                     age1 = paste0(range(AGECOL, na.rm = T), collapse = " - "),
+                     age2 = meansd(AGECOL),
+                     height = meansd(HEIGHT),
+                     weight = meansd(WEIGHT),
+                     BMI = meansd(BMI),
+                     LDL = meansd(LDL),
+                     HDL = meansd(HDL)) %>% 
+    mutate(Gout = rep("0 (0.0)", nrow(.)),
+           Diabetes = rep("0 (0.0)", nrow(.))) %>% data.frame()
+  return(as.data.frame(tab))
+}
+
+PTOcohort1 <- clinical_table2(CETP_PTO_Poly)
+
+PTOcohort2 <- clinical_table2(CETP_PTO_NonPoly)
+
+# Creating the combined demo table 
+demotable <- rbind(allpoly_demos1, NZ_Maori2, CIMaori2, Samoan2, Tongan2, Niuean2, Pukapukan2, Other_Polynesian2, NPH2, PTOcohort1, PTOcohort2)
+row.names(demotable) <- c("Aotearoa/NZ cohort", "NZ Maori", "CI Maori", "Samoan", "Tongan", "Niuean", "Pukapukan", "Other Polynesian", "Ngati Porou Hauora", "Pacific Trust Otago - Polynesian", "Pacific Trust Otago - Other")
+colnames(demotable) <- c("Participants (n)",  "Sex (male), n (%)", "Age Range", "Age Distribution", "Height (cm)", "Weight (kg)", "BMI (kg/m2)", "Low Density Lipids (mmol/L)", "High Density Lipids (mmol/L)", "Gout, n (%)", "Diabetes, n (%)")
+demotable <- as.data.frame(t(demotable))
+demotable <- demotable %>% rownames_to_column()
+write_delim(demotable, file = "Tables/Demographic_Table.txt", delim = "\t")
+
+# Kable demographic table 
+#kable(demotable, "html", caption = "Demographic data") %>% 
+#  kable_styling("striped", full_width = FALSE) %>% 
+#  footnote(general = "Unless specified data is presented as mean \u00b1 SD") %>% 
+#  column_spec(1, border_right = T)
+
+rm(allpoly_demos1, allpoly_demos, CIMaori1, CIMaori2, demo, Niuean1, Niuean2, NPH1, NPH2, NZ_Maori1, NZ_Maori2, Other_Polynesian1, Other_Polynesian2, PTOcohort, Pukapukan1, Pukapukan2, Samoan1, Samoan2, tmp, Tongan1, Tongan2)
+```
+
+Here, various statistics about the 16_57004947 variant in each cohort are made into a table.
+
+```{r MAFandHWE, message = F, warning = F, cache = T}
+# Function to calculate the allele frequencies and HWE of the total dataset
+clin_tab_T  <- function(datasetx) {
+     tab <- datasetx %>%
+     select(Pheno.SampleID, `16_57004947`, X16_57004947_down) %>%
+     dplyr::summarise(CC = npercent(`16_57004947`, "CC"),
+                      CT = npercent(`16_57004947`, "CT"),
+                      TT = npercent(`16_57004947`, "TT"),
+                      MAF1 = sprintf(fmt = "%.4f", (sum(X16_57004947_down, na.rm = T) / (table(is.na(X16_57004947_down))[1] * 2))),
+                      HWE1 = sprintf(fmt ="%.4f", as.numeric(hwepval(`16_57004947`, "CC", "CT", "TT")))) %>% t() %>% data.frame()
+  return(as.data.frame(tab))
+}
+
+# Creating the table 
+cuz <- c("CC", "CT", "TT", "16_57004947 (MAF)", "16_57004947 (HWE)")
+
+
+# Poly wide frequencies
+tmp <- allpoly %>% filter(COHORT != "NPH")
+polytable <- as.data.frame(matrix(nrow = 5, ncol = 1))
+row.names(polytable) <- cuz
+PWfreq <- clin_tab_T(tmp) # total 
+polytable[1:5, 1] <- as.character(PWfreq[1:5, 1])
+
+NZ_Maoritable <- as.data.frame(matrix(nrow = 5, ncol = 1))
+row.names(NZ_Maoritable) <- cuz
+NZ_Maorifreq <- clin_tab_T(NZ_Maori) # total 
+NZ_Maoritable[1:5, 1] <- as.character(NZ_Maorifreq[1:5, 1])
+
+Othertable <- as.data.frame(matrix(nrow = 5, ncol = 1))
+row.names(Othertable) <- cuz
+Otherfreq <- clin_tab_T(Other_Polynesian) # total 
+Othertable[1:5, 1] <- as.character(Otherfreq[1:5, 1])
+
+Samoantable <- as.data.frame(matrix(nrow = 5, ncol = 1))
+row.names(Samoantable) <- cuz
+Samoanfreq <- clin_tab_T(Samoan) # total 
+Samoantable[1:5, 1] <- as.character(Samoanfreq[1:5, 1])
+
+Tongantable <- as.data.frame(matrix(nrow = 5, ncol = 1))
+row.names(Tongantable) <- cuz
+Tonganfreq <- clin_tab_T(Tongan) # total 
+Tongantable[1:5, 1] <- as.character(Tonganfreq[1:5, 1])
+
+Niueantable <- as.data.frame(matrix(nrow = 5, ncol = 1))
+row.names(Niueantable) <- cuz
+Niueanfreq <- clin_tab_T(Niuean) # total 
+Niueantable[1:5, 1] <- as.character(Niueanfreq[1:5, 1])
+
+Pukapukantable <- as.data.frame(matrix(nrow = 5, ncol = 1))
+row.names(Pukapukantable) <- cuz
+Pukapukanfreq <- clin_tab_T(Pukapukan) # total 
+Pukapukantable[1:5, 1] <- as.character(Pukapukanfreq[1:5, 1])
+
+CIMaoritable <- as.data.frame(matrix(nrow = 5, ncol = 1))
+row.names(CIMaoritable) <- cuz
+CIMaorifreq <- clin_tab_T(CIMaori) # total 
+CIMaoritable[1:5, 1] <- as.character(CIMaorifreq[1:5, 1])
+
+NPHtable <- as.data.frame(matrix(nrow = 5, ncol = 1))
+row.names(NPHtable) <- cuz
+NPHfreq <- clin_tab_T(NPH) # total 
+NPHtable[1:5, 1] <- as.character(NPHfreq[1:5, 1])
+
+PTOtable1 <- as.data.frame(matrix(nrow = 5, ncol = 1))
+row.names(PTOtable1) <- cuz
+PTOfreq1 <- clin_tab_T(CETP_PTO_Poly) # total 
+PTOtable1[1:5, 1] <- as.character(PTOfreq1[1:5, 1])
+
+PTOtable2 <- as.data.frame(matrix(nrow = 5, ncol = 1))
+row.names(PTOtable2) <- cuz
+PTOfreq2 <- clin_tab_T(CETP_PTO_NonPoly) # total 
+PTOtable2[1:5, 1] <- as.character(PTOfreq2[1:5, 1])
+
+# Combining NZ wide and NPH frequency tables 
+all_freq <- cbind.data.frame(polytable, NZ_Maoritable, CIMaoritable, Samoantable, Tongantable, Niueantable, Pukapukantable, Othertable, NPHtable, PTOtable1, PTOtable2)
+ 
+row.names(all_freq) <- c("CC", "CT", "TT", "MAF", "HWE")
+colnames(all_freq) <- c("A/NZ Polynesian-wide", "NZ Māori", "CI Māori", "Samoan", "Tongan", "Niuean", "Pukapukan", "Other Polynesian", "Ngati Porou Hauora", "Pacific Trust Otago - Polynesian", "Pacific Trust Otago - Other")
+
+all_freq <- all_freq %>% rownames_to_column()
+write_delim(all_freq, "Tables/MAFandHWE.txt", delim = "\t")
+ 
+# Making kable table 
+#kable(all_freq, "html", caption = "Genotype frequencies, minor allele frequencies and Hardy Weinberg", escape = F) %>%
+#  kable_styling("striped", full_width = FALSE) %>%
+#  footnote(general = "Minor allele frequency (MAF), Hardy Weinberg Equilibrium (HWE)") %>%
+#  column_spec(1, border_right = T)
+
+rm(CIMaorifreq, CIMaoritable, Niueanfreq, Niueantable, NPHfreq, NPHtable, NZ_Maorifreq, NZ_Maoritable, Otherfreq, Othertable, Pukapukanfreq, Pukapukantable, Samoanfreq, Samoantable, Tonganfreq, Tongantable, tmp, PTOfreq1, PTOtable1, PTOfreq2, PTOtable2, polytable, PWfreq, cuz)
+```
+
+Now, some plots are produced and statistical tests are run.
+
+```{r PlotsandStats, message = F, warning = F, cache = T}
+# Plotting distribution of LDL and HDL in all cohorts
+# First making dataset for plotting
+tmp <- allpoly %>% filter(COHORT != "NPH") %>% mutate(Ethnicity1 = as.character(Pheno.SpecificEthnicity), Ethnicity2 = case_when(Ethnicity1 %in% c("Other Polynesian", "French Polynesian", "Tuvaluan") ~ "Other/Mixed", Ethnicity1 == "NZ Maori" ~ "NZ Māori", Ethnicity1 == "CI Maori" ~ "CI Māori", Ethnicity1 == "Niuean" ~ "Niuēan", TRUE ~ Ethnicity1), Ethnicity2 = factor(Ethnicity2, levels = c("NZ Māori", "CI Māori", "Samoan", "Tongan", "Niuēan", "Pukapukan", "Other/Mixed"))) %>% select(Ethnicity2, HDL, LDL, `16_57004947`)
+
+tmp2 <- NPH %>% mutate(Ethnicity2 = rep("NPH", nrow(.))) %>% select(Ethnicity2, HDL, LDL, `16_57004947`)
+
+tmp3 <- CETP_PTO_Poly %>% mutate(Ethnicity2 = rep("PTO", nrow(.))) %>% select(Ethnicity2, HDL, LDL, `16_57004947`)
+
+tmp5 <- CETP_PTO_NonPoly %>% mutate(Ethnicity2 = rep("PTO", nrow(.))) %>% select(Ethnicity2, HDL, LDL, `16_57004947`)
+
+tmp4 <- rbind(tmp, tmp2, tmp3, tmp5)
+
+# Now running stats on HDL/LDL
+summary(aov(HDL ~ Ethnicity2, data = tmp4))
+
+summary(aov(LDL ~ Ethnicity2, data = tmp4))
+
+TukeyHSD(aov(HDL ~ Ethnicity2, data = tmp4))
+
+TukeyHSD(aov(LDL ~ Ethnicity2, data = tmp4))
+
+# Now making datasets for labelling plots
+tmpHDL <- aggregate(HDL ~ Ethnicity2, tmp4, max) %>% 
+  mutate(tukeygroup = case_when(Ethnicity2 == "PTO" ~ "b", TRUE ~ "a"))
+
+tmpLDL <- aggregate(LDL ~ Ethnicity2, tmp4, max) %>% 
+  mutate(tukeygroup = case_when(Ethnicity2 == "PTO" ~ "b", TRUE ~ "a"))
+
+#ggplot(data = tmp4, aes(x = `16_57004947`, y = HDL)) + geom_violin(show.legend = FALSE) + theme(axis.title.x = element_blank()) + labs(y = "HDL-C (mmol/L)")
+#ggplot(data = tmp4, aes(x = `16_57004947`, y = LDL)) + geom_violin(show.legend = FALSE) + theme(axis.title.x = element_blank()) + labs(y = "LDL-C (mmol/L)")
+
+# Plotting
+ggplot(data = tmp4, aes(x = Ethnicity2, y = HDL, color = Ethnicity2)) + geom_boxplot(show.legend = FALSE) + labs(y = "HDL-C (mmol/L)") + scale_x_discrete(limits = c("NZ Māori", "CI Māori", "Samoan", "Tongan", "Niuēan", "Pukapukan", "Other/Mixed", "NPH", "PTO")) + scale_y_continuous(limits = c(0, 5), expand = c(0, 0)) + theme_bw() + theme(axis.title.x = element_blank()) + geom_text(data = tmpHDL, aes(label = tukeygroup, y = HDL + 0.3), color = "black", alpha = 0.5, show.legend = FALSE)
+
+ggsave("Figures/HDL_Ethnicity.png", width = 7, height = 4, dpi = 300, units = "in")
+
+ggplot(data = tmp4, aes(x = Ethnicity2, y = LDL, color = Ethnicity2)) + geom_boxplot(show.legend = FALSE) + labs(y = "LDL-C (mmol/L)") + scale_x_discrete(limits = c("NZ Māori", "CI Māori", "Samoan", "Tongan", "Niuēan", "Pukapukan", "Other/Mixed", "NPH", "PTO")) + scale_y_continuous(limits = c(0, 8), expand = c(0, 0)) + theme_bw() + theme(axis.title.x = element_blank()) + geom_text(data = tmpLDL, aes(label = tukeygroup, y = LDL + 0.3), color = "black", alpha = 0.5, show.legend = FALSE)
+
+ggsave("Figures/LDL_Ethnicity.png", width = 7, height = 4, dpi = 300, units = "in")
+
+#ggplot(data = tmp4, aes(x = Ethnicity2, y = HDL, color = Ethnicity2)) + geom_violin(show.legend = FALSE, draw_quantiles = c(0.25, 0.50, 0.75)) + geom_jitter(show.legend = FALSE, width = 0.1, alpha = 0.3) + theme(axis.title.x = element_blank()) + labs(y = "HDL-C (mmol/L)") + scale_x_discrete(limits = c("NZ Maori", "CI Maori", "Samoan", "Tongan", "Niuean", "Pukapukan", "Other Polynesian", "NPH", "PTO"))
+
+#ggplot(data = tmp4, aes(x = Ethnicity2, y = HDL, color = Ethnicity2)) + geom_boxplot(show.legend = FALSE) + geom_jitter(show.legend = FALSE, width = 0.1, alpha = 0.3) + theme(axis.title.x = element_blank()) + labs(y = "HDL-C (mmol/L)") + scale_x_discrete(limits = c("NZ Maori", "CI Maori", "Samoan", "Tongan", "Niuean", "Pukapukan", "Other Polynesian", "NPH", "PTO"))
+
+rm(tmp, tmp2, tmp3, tmp4, tmpHDL, tmpLDL)
+
+
+# CETP activity figure
+activity <- read_csv("CETP_assay.csv")
+activity[9, 2] <- mean(c(3.405, 5.281))
+activity$GENO <- as.factor(activity$GENO)
+
+ggplot(data = activity, aes(x = GENO, y = CETP)) + stat_summary(fun = mean, geom = "bar", fill = "#00A651", width = 0.7) + stat_summary(fun.data = mean_se, fun.args = list(mult = 1), geom = "errorbar", width = 0.3, size = 1) + geom_jitter(show.legend = FALSE, width = 0.1, size = 2) + labs(y = "CETP activity (pmol/hr/\u00B5L)") + scale_y_continuous(breaks = c(0, 2, 4, 6, 8, 10), limits = c(0, 10), expand = c(0, 0)) + theme_bw() + theme(axis.title.x = element_blank(), panel.grid = element_blank(), axis.title.y = element_text(face = "bold", size = 14), axis.text.y = element_text(face = "bold", size = 14), axis.text.x = element_text(face = "bold", size = 14), panel.border = element_blank(), axis.line = element_line(), plot.margin = unit(c(0.5, 0.2, 0.2, 0.2), units = "cm")) + stat_compare_means(comparisons = list(c("CC", "CT")), label.y = 9.2, label.x = 1.38, method = "t.test", label = "p.signif", size = 5)
+
+ggsave("Figures/CETP_Assay_Fig.png", width = 6, height = 4, dpi = 300, units = "in")
+
+# Statistical test
+t.test(activity %>% filter(GENO == "CC") %>% pull(CETP), activity %>% filter(GENO == "CT") %>% pull(CETP), paired = F)
+```
+
+This code creates Plink files for use in the models that adjust for relatedness.
+
+```{r MakePlinkFiles, eval = F, message = F, warning = F}
+# Matching bed/bim/fam to allpoly
+all_coreex_ids <- read.delim("CZ-MB1.2-QC1.10_CoreExome24-1.0-3_genotyped-QCd_rsIDconverted.fam", stringsAsFactors = F, header = F, sep = " ")
+
+poly_ids <- all_coreex_ids %>% filter(V2 %in% allpoly$Pheno.SampleID)
+
+poly_ids <- poly_ids %>% select(V1, V2)
+
+write.table(poly_ids, file = "allpoly_plinkfilter.txt", col.names = F, row.names = F, quote = F)
+
+# Bash script (plink_filtering.sh) filters out the polynesian IDs from the full CoreEx plink files
+# Copy and paste into bash (in this directory): bash filtering_plink.sh
+
+# Reading output ped/map back into R to convert to our SNP
+example_ped <- read_delim("../allpoly_allcoreex.ped", delim = " ", col_names = F)
+
+CETP_ped <- example_ped %>% select(X1:X6)
+CETP_geno <- allpoly %>% separate(`16_57004947`, sep = "", into = c("remove", "A1", "A2")) %>% select(Geno.SampleID, A1, A2)
+
+CETP_ped <- CETP_ped %>% left_join(CETP_geno, by = c("X2" = "Geno.SampleID"))
+
+write_delim(CETP_ped, file = "CETP.ped", delim = " ", col_names = F)
+
+# Now make a nano equivalent of allpoly_allcoreex.map which has our SNP and is called CETP.map
+# 16      16_57004947     100     57004947
+
+# Now finally, use plink to convert the ped and map to bed/bim/fam
+# Run: bash convertpedtobed.sh
+
+# Cleaning up
+rm(all_coreex_ids, bimfile, CETP_geno, CETP_ped, example_ped, poly_ids)
+```
+
+The genetic relatedness matrix for the entire CoreExome is read in and filtered to only contain individuals to be studied.
+
+```{r GRM, eval = F, message = F, warning = F}
+# Filter GRM to only contain samples of interest
+# Bare in mind that selecting columns of a tibble will silently drop the row names, make sure you add them back in the correct order
+# Import Relatedness Matrix (see unix code)
+GRM <- vroom(file = "../GRM_matrix_all_coreex.cXX.txt", delim = "\t", col_names = F)
+
+#GRM <- read.table("GRM_matrix_all_coreex.cXX.txt", header = FALSE, na.strings = "NA",""," ",fill=TRUE,quote='')
+fam_file <- read_delim("CZ-MB1.2-QC1.10_CoreExome24-1.0-3_genotyped-QCd_rsIDconverted.fam", delim = " ", col_names = F)
+colnames(GRM) <- fam_file$X2
+rownames(GRM) <- fam_file$X2
+GRM2 <- GRM[which(row.names(GRM) %in% allpoly$Pheno.SampleID), which(row.names(GRM) %in% allpoly$Pheno.SampleID)]
+
+# convert GRM to matrix
+GRM_mat <- as.matrix(GRM2)
+row.names(GRM_mat) <- colnames(GRM_mat)
+
+rm(GRM, fam_file, GRM2)
+```
+
+All models are run here.
+
+```{r Models, eval = F, message = F, warning = F}
+# Now time to run the GMMAT things
+# Perform Wald Test - for candidate SNPs make list of SNPs
+snps <- "16_57004947"
+plink_prefix <- "CETP"
+
+# HDL models
+simple_wald_HDL <- function(dataset){
+  glmm.wald(fixed = HDL ~ Pheno.Age + Pheno.Gender + Geno.PCVector1 + Geno.PCVector2 + Geno.PCVector3 + Geno.PCVector4 + Geno.PCVector5 + Geno.PCVector6 + Geno.PCVector7 + Geno.PCVector8 + Geno.PCVector9 + Geno.PCVector10, data = dataset, kins = GRM_mat, id = "Geno.SampleID", family = gaussian(link = "identity"), infile = plink_prefix, snps = snps)
+}
+
+tmp <- allpoly %>% filter(COHORT != "NPH")
+wald_result_HDL_allpoly <- simple_wald_HDL(tmp)
+
+wald_result_HDL_NZ_Maori <- simple_wald_HDL(NZ_Maori)
+
+wald_result_HDL_CIMaori <- simple_wald_HDL(CIMaori)
+
+wald_result_HDL_Samoan <- simple_wald_HDL(Samoan)
+
+wald_result_HDL_Tongan <- simple_wald_HDL(Tongan)
+
+wald_result_HDL_Niuean <- simple_wald_HDL(Niuean)
+
+wald_result_HDL_Pukapukan <- simple_wald_HDL(Pukapukan)
+
+wald_result_HDL_Other_Polynesian <- simple_wald_HDL(Other_Polynesian)
+
+wald_result_HDL_NPH <- simple_wald_HDL(NPH)
+
+wald_HDL_results <- rbind(wald_result_HDL_allpoly, wald_result_HDL_NZ_Maori, wald_result_HDL_CIMaori, wald_result_HDL_Samoan, wald_result_HDL_Tongan, wald_result_HDL_Niuean, wald_result_HDL_Pukapukan, wald_result_HDL_Other_Polynesian, wald_result_HDL_NPH) %>% 
+  mutate(COHORT = c("ANZ Polynesian", "NZ Maori", "CI Maori", "Samoan", "Tongan", "Niuean", "Pukapukan", "Other Polynesian", "NPH"),
+         BETA = -1 * BETA,
+         AF = 1 - AF,
+         A1 = rep("C", nrow(.)),
+         A2 = rep("T", nrow(.)))
+
+
+# LDL models
+simple_wald_LDL <- function(dataset){
+  glmm.wald(fixed = LDL ~ Pheno.Age + Pheno.Gender + Geno.PCVector1 + Geno.PCVector2 + Geno.PCVector3 + Geno.PCVector4 + Geno.PCVector5 + Geno.PCVector6 + Geno.PCVector7 + Geno.PCVector8 + Geno.PCVector9 + Geno.PCVector10, data = dataset, kins = GRM_mat, id = "Geno.SampleID", family = gaussian(link = "identity"), infile = plink_prefix, snps = snps)
+}
+
+tmp <- allpoly %>% filter(COHORT != "NPH")
+wald_result_LDL_allpoly <- simple_wald_LDL(tmp)
+
+wald_result_LDL_NZ_Maori <- simple_wald_LDL(NZ_Maori)
+
+wald_result_LDL_CIMaori <- simple_wald_LDL(CIMaori)
+
+wald_result_LDL_Samoan <- simple_wald_LDL(Samoan)
+
+wald_result_LDL_Tongan <- simple_wald_LDL(Tongan)
+
+wald_result_LDL_Niuean <- simple_wald_LDL(Niuean)
+
+wald_result_LDL_Pukapukan <- simple_wald_LDL(Pukapukan)
+
+wald_result_LDL_Other_Polynesian <- simple_wald_LDL(Other_Polynesian)
+
+wald_result_LDL_NPH <- simple_wald_LDL(NPH)
+
+wald_LDL_results <- rbind(wald_result_LDL_allpoly, wald_result_LDL_NZ_Maori, wald_result_LDL_CIMaori, wald_result_LDL_Samoan, wald_result_LDL_Tongan, wald_result_LDL_Niuean, wald_result_LDL_Pukapukan, wald_result_LDL_Other_Polynesian, wald_result_LDL_NPH) %>% 
+  mutate(COHORT = c("ANZ Polynesian", "NZ Maori", "CI Maori", "Samoan", "Tongan", "Niuean", "Pukapukan", "Other Polynesian", "NPH"),
+         BETA = -1 * BETA,
+         AF = 1 - AF,
+         A1 = rep("C", nrow(.)),
+         A2 = rep("T", nrow(.)))
+
+rm(tmp, snps, plink_prefix, wald_result_HDL_allpoly, wald_result_HDL_CIMaori, wald_result_HDL_Niuean, wald_result_HDL_NPH, wald_result_HDL_NZ_Maori, wald_result_HDL_Other_Polynesian, wald_result_HDL_Pukapukan, wald_result_HDL_Samoan, wald_result_HDL_Tongan, wald_result_LDL_allpoly, wald_result_LDL_CIMaori, wald_result_LDL_Niuean, wald_result_LDL_NPH, wald_result_LDL_NZ_Maori, wald_result_LDL_Other_Polynesian, wald_result_LDL_Pukapukan, wald_result_LDL_Samoan, wald_result_LDL_Tongan, simple_wald_HDL, simple_wald_LDL)
+
+# Now for PTO
+CETP_PTO_Poly <- CETP_PTO_Poly %>% mutate(AGECOL = as.numeric(AGECOL), SEX = as.numeric(SEX), PGF = as.factor(PGF), PGM = as.factor(PGM), MGF = as.factor(MGF), MGM = as.factor(MGM))
+
+test1 <- lm(HDL ~ X16_57004947_down + AGECOL + SEX + PGF + PGM + MGF + MGM, data = CETP_PTO_Poly)
+test2 <- lm(LDL ~ X16_57004947_down + AGECOL + SEX + PGF + PGM + MGF + MGM, data = CETP_PTO_Poly)
+
+# R-squared values
+#rsq.partial(test1)
+
+#rsq.partial(test2)
+
+# Adding to full results
+HDL_PTO_result <- c("16", "16_57004947", "100", "57004947", "C", "T", nrow(CETP_PTO_Poly), "NA", summary(test1)$coefficients[2, 1], summary(test1)$coefficients[2, 2], summary(test1)$coefficients[2, 4], "TRUE", "PTO")
+LDL_PTO_result <- c("16", "16_57004947", "100", "57004947", "C", "T", nrow(CETP_PTO_Poly), "NA", summary(test2)$coefficients[2, 1], summary(test2)$coefficients[2, 2], summary(test2)$coefficients[2, 4], "TRUE", "PTO")
+
+HDL_PTO_result <- as.data.frame(t(as.data.frame(HDL_PTO_result)))
+colnames(HDL_PTO_result) <- colnames(wald_HDL_results)
+
+full_HDL_results <- wald_HDL_results %>% rbind(HDL_PTO_result) %>% select(-cM, -converged)
+
+LDL_PTO_result <- as.data.frame(t(as.data.frame(LDL_PTO_result)))
+colnames(LDL_PTO_result) <- colnames(wald_LDL_results)
+
+full_LDL_results <- wald_LDL_results %>% rbind(LDL_PTO_result) %>% select(-cM, -converged)
+
+write_delim(full_HDL_results, file = "full_HDL_results.txt", delim = "\t")
+
+write_delim(full_LDL_results, file = "full_LDL_results.txt", delim = "\t")
+
+rm(HDL_PTO_result, LDL_PTO_result, test1, test2, wald_HDL_results, wald_LDL_results)
+```
+
+Meta-analysis plots are produced here.
+
+```{r Metaplots, message = F, warning = F, cache = T}
+# Forest plot for HDL
+# Loading Data
+full_HDL_results <- read_delim("full_HDL_results.txt", delim = "\t")
+
+full_LDL_results <- read_delim("full_LDL_results.txt", delim = "\t")
+
+HDL <- tribble(~"Study", ~"Group", ~"Beta", ~"Error",
+                  "NZ Māori", "Aotearoa NZ Discovery Cohort", full_HDL_results[[2, "BETA"]], full_HDL_results[[2, "SE"]],
+                  "CI Māori", "Aotearoa NZ Discovery Cohort", full_HDL_results[[3, "BETA"]], full_HDL_results[[3, "SE"]],
+                  "Samoan", "Aotearoa NZ Discovery Cohort", full_HDL_results[[4, "BETA"]], full_HDL_results[[4, "SE"]],
+                  "Tongan", "Aotearoa NZ Discovery Cohort", full_HDL_results[[5, "BETA"]], full_HDL_results[[5, "SE"]],
+                  "Niuēan", "Aotearoa NZ Discovery Cohort", full_HDL_results[[6, "BETA"]], full_HDL_results[[6, "SE"]],
+                  "Mixed/Other Polynesian", "Aotearoa NZ Discovery Cohort", full_HDL_results[[8, "BETA"]], full_HDL_results[[8, "SE"]],
+                  "Ngāti Porou Hauora", "Aotearoa NZ Discovery Cohort", full_HDL_results[[9, "BETA"]], full_HDL_results[[9, "SE"]],
+                  "Samoan I", "Samoan Replication Cohort", 0.225, 0.018,
+                  "Samoan II", "Samoan Replication Cohort", 0.193, 0.028,
+                  "Samoan III", "Samoan Replication Cohort", 0.242, 0.036)
+
+# Perform meta analyses
+HDL_mod <- metagen(TE = Beta, # treatment effect (beta or log OR)
+                      seTE = Error, # standard error
+                      studlab = Study, # study labels
+                      byvar = Group,
+                      data = HDL  # file of input data
+)
+
+HDL_mod$studysize <- as.character(c(nrow(NZ_Maori %>% filter(!is.na(HDL))), nrow(CIMaori %>% filter(!is.na(HDL))), nrow(Samoan %>% filter(!is.na(HDL))), nrow(Tongan %>% filter(!is.na(HDL))), nrow(Niuean %>% filter(!is.na(HDL))), nrow(Other_Polynesian %>% filter(!is.na(HDL))), nrow(NPH %>% filter(!is.na(HDL))), "2851", "908", "550"))
+HDL_mod$pval <- sprintf(fmt = "%.2e", HDL_mod$pval)
+
+# Make tidier forest plots & save
+# saves first forest plot
+#png(filename = "Figures/HDL_meta.png", 
+#    width = 7.5, # how wide to make the .png
+#    height = 5.5, # how tall to make the .png (make 3 or 4 if not including 'byvar' in the meta)
+#    units = "in", # above measures are in inches
+#    res = 300) # resolution is 300dpi [this makes a large, good resolution image for use on posters, but also best for getting high quality images in journals]
+
+forest(HDL_mod, 
+       leftcols = c("studlab"), # specify what columns to plot at left of graph
+       leftlabs = c("Cohort"), # specify column labels (for above)
+       rightcols = c("studysize", "effect", "ci", "pval"),
+       rightlabs = c("N", "Beta", "[95% CI]", "P"), # don't plot any columns on right of graph
+       
+       comb.random = FALSE, # don't plot random effect; switch to comb.fixed = FALSE to only plot random effect
+       text.fixed = "Overall Effect", # label for overall effect; switch to text.random if plotting random effect
+       test.overall.fixed = FALSE, # print p value of overall effect; switch to test.overall.random if plotting random effect
+       
+       xlab = "HDL-C (mmol/L)", # label for x-axis
+       xlim = c(-1, 1), # x-axis limits
+       
+       print.Q = FALSE, # print heterogeneity Q value
+       print.pval.Q = FALSE, # print heterogeneity Q p value
+       print.tau2 = FALSE, # don't print tau^2 value
+       print.I2 = FALSE, # don't print I^2 value
+       
+       digits = 3, # beta value digits
+       digits.se = 3, # standard error digits
+       digits.pval.Q = 1, # heterogeneity p digits
+       digits.pval = 1, # overall effect p digits
+       scientific.pval = TRUE, # make heterogeneity and overall p-values scientific notation
+       
+       col.square = "darkgreen", # colour of cohort effects
+       col.diamond = "black", # colour of overall effect
+       
+       print.byvar = FALSE # removes "Group = " from header of subgroups
+)
+#dev.off() # saves plot into .png file
+
+# LDL Forest plot
+LDL <- tribble(~"Study", ~"Group", ~"Beta", ~"Error",
+                  "NZ Māori", "Aotearoa NZ Discovery Cohort", full_LDL_results[[2, "BETA"]], full_LDL_results[[2, "SE"]],
+                  "CI Māori", "Aotearoa NZ Discovery Cohort", full_LDL_results[[3, "BETA"]], full_LDL_results[[3, "SE"]],
+                  "Samoan", "Aotearoa NZ Discovery Cohort", full_LDL_results[[4, "BETA"]], full_LDL_results[[4, "SE"]],
+                  "Tongan", "Aotearoa NZ Discovery Cohort", full_LDL_results[[5, "BETA"]], full_LDL_results[[5, "SE"]],
+                  "Niuean", "Aotearoa NZ Discovery Cohort", full_LDL_results[[6, "BETA"]], full_LDL_results[[6, "SE"]],
+                  "Mixed/Other Polynesian", "Aotearoa NZ Discovery Cohort", full_LDL_results[[8, "BETA"]], full_LDL_results[[8, "SE"]],
+                  "Ngati Porou Hauora", "Aotearoa NZ Discovery Cohort", full_LDL_results[[9, "BETA"]], full_LDL_results[[9, "SE"]],
+                  "Samoan I", "Samoan Replication Cohort", -0.134, 0.053,
+                  "Samoan II", "Samoan Replication Cohort", -0.276, 0.095,
+                  "Samoan III", "Samoan Replication Cohort", -0.077, 0.120)
+
+# Perform meta analyses
+LDL_mod <- metagen(TE = Beta, # treatment effect (beta or log OR)
+                      seTE = Error, # standard error
+                      studlab = Study, # study labels
+                      byvar = Group,
+                      data = LDL  # file of input data
+)
+
+LDL_mod$studysize <- as.character(c(nrow(NZ_Maori %>% filter(!is.na(LDL))), nrow(CIMaori %>% filter(!is.na(LDL))), nrow(Samoan %>% filter(!is.na(LDL))), nrow(Tongan %>% filter(!is.na(LDL))), nrow(Niuean %>% filter(!is.na(LDL))), nrow(Other_Polynesian %>% filter(!is.na(LDL))), nrow(NPH %>% filter(!is.na(LDL))), "2851", "882", "542"))
+LDL_mod$pval <- sprintf(fmt = "%.2e", LDL_mod$pval)
+
+# Make tidier forest plots & save
+# saves first forest plot
+#png(filename = "Figures/LDL_meta.png", 
+#    width = 7.5, # how wide to make the .png
+#    height = 5.5, # how tall to make the .png (make 3 or 4 if not including 'byvar' in the meta)
+#    units = "in", # above measures are in inches
+#    res = 300) # resolution is 300dpi [this makes a large, good resolution image for use on posters, but also best for getting high quality images in journals]
+
+forest(LDL_mod, 
+       leftcols = c("studlab"), # specify what columns to plot at left of graph
+       leftlabs = c("Cohort"), # specify column labels (for above)
+       rightcols = c("studysize", "effect", "ci", "pval"),
+       rightlabs = c("N", "Beta", "[95% CI]", "P"), # don't plot any columns on right of graph
+       
+       comb.random = FALSE, # don't plot random effect; switch to comb.fixed = FALSE to only plot random effect
+       text.fixed = "Overall Effect", # label for overall effect; switch to text.random if plotting random effect
+       test.overall.fixed = FALSE, # print p value of overall effect; switch to test.overall.random if plotting random effect
+       
+       xlab = "LDL-C (mmol/L)", # label for x-axis
+       xlim = c(-1, 1), # x-axis limits
+       
+       print.Q = FALSE, # print heterogeneity Q value
+       print.pval.Q = FALSE, # print heterogeneity Q p value
+       print.tau2 = FALSE, # don't print tau^2 value
+       print.I2 = FALSE, # don't print I^2 value
+       
+       digits = 3, # beta value digits
+       digits.se = 3, # standard error digits
+       digits.pval.Q = 1, # heterogeneity p digits
+       digits.pval = 1, # overall effect p digits
+       scientific.pval = TRUE, # make heterogeneity and overall p-values scientific notation
+       
+       col.square = "darkgreen", # colour of cohort effects
+       col.diamond = "black", # colour of overall effect
+       
+       print.byvar = FALSE # removes "Group = " from header of subgroups
+)
+#dev.off() # saves plot into .png file
+```
+
+The plot for the PTO cohort is produced here.
+
+```{r PTOplot, message = F, warning = F, cache = T}
+test1 <- lm(HDL ~ X16_57004947_down + AGECOL + SEX + PGF + PGM + MGF + MGM, data = CETP_PTO_Poly)
+test2 <- lm(LDL ~ X16_57004947_down + AGECOL + SEX + PGF + PGM + MGF + MGM, data = CETP_PTO_Poly)
+
+PTO_results <- full_HDL_results %>% filter(COHORT == "PTO") %>% mutate(Outcome = "HDL", LCL = as.numeric(confint.default(test1)[2,])[1], UCL = as.numeric(confint.default(test1)[2,])[2]) %>% full_join(full_LDL_results %>% filter(COHORT == "PTO") %>% mutate(Outcome = "LDL", LCL = as.numeric(confint.default(test2)[2,])[1], UCL = as.numeric(confint.default(test2)[2,])[2]))
+
+ggplot(PTO_results, aes(x = as.numeric(BETA), y = 1)) + geom_point(size = 3, color = "#00A651") + geom_errorbar(aes(xmin = LCL, xmax = UCL), width = 0.1, color = "#00A651") + geom_vline(xintercept = 0) + labs(x = "Effect Size (mmol/L)") + xlim(c(-1, 1)) + facet_wrap(~ Outcome, ncol = 1) + theme_bw() + ylim(c(0.5, 1.5)) + theme(axis.title.y = element_blank(), axis.text.y = element_blank(), axis.ticks.y = element_blank(), panel.grid.major.y = element_blank(), panel.grid.minor.y = element_blank())
+
+ggsave("Figures/PTO_Results.png", width = 4.5, height = 3, dpi = 300, units = "in")
+
+
+# Making meta-analysis type figure for PTO
+PTO <- tribble(~"Outcome", ~"Beta", ~"Error",
+                  "HDL", full_HDL_results[[10, "BETA"]], full_HDL_results[[10, "SE"]],
+                  "LDL", full_LDL_results[[10, "BETA"]], full_LDL_results[[10, "SE"]])
+
+# Perform meta analyses
+PTO_mod <- metagen(TE = Beta, # treatment effect (beta or log OR)
+                      seTE = Error, # standard error
+                      studlab = Outcome,
+                      data = PTO  # file of input data
+)
+
+PTO_mod$studysize <- as.character(c(nrow(CETP_PTO_Poly %>% filter(!is.na(HDL))), nrow(CETP_PTO_Poly %>% filter(!is.na(LDL)))))
+PTO_mod$pval <- sprintf(fmt = "%.2e", PTO_mod$pval)
+
+# Make tidier forest plots & save
+# saves first forest plot
+png(filename = "Figures/PTO_meta.png", 
+    width = 7.5, # how wide to make the .png
+    height = 3.5, # how tall to make the .png (make 3 or 4 if not including 'byvar' in the meta)
+    units = "in", # above measures are in inches
+    res = 300) # resolution is 300dpi [this makes a large, good resolution image for use on posters, but also best for getting high quality images in journals]
+
+forest(PTO_mod, 
+       leftcols = c("studlab"), # specify what columns to plot at left of graph
+       leftlabs = c("Outcome"), # specify column labels (for above)
+       rightcols = c("studysize", "effect", "ci", "pval"),
+       rightlabs = c("N", "Beta", "[95% CI]", "P"), # don't plot any columns on right of graph
+       
+       comb.random = FALSE, # don't plot random effect; switch to comb.fixed = FALSE to only plot random effect
+       text.fixed = "Overall Effect", # label for overall effect; switch to text.random if plotting random effect
+       test.overall.fixed = FALSE, # print p value of overall effect; switch to test.overall.random if plotting random effect
+       
+       xlab = "Effect Size (mmol/L)", # label for x-axis
+       xlim = c(-1, 1), # x-axis limits
+       
+       print.Q = FALSE, # print heterogeneity Q value
+       print.pval.Q = FALSE, # print heterogeneity Q p value
+       print.tau2 = FALSE, # don't print tau^2 value
+       print.I2 = FALSE, # don't print I^2 value
+       
+       digits = 3, # beta value digits
+       digits.se = 3, # standard error digits
+       digits.pval.Q = 1, # heterogeneity p digits
+       digits.pval = 1, # overall effect p digits
+       scientific.pval = TRUE, # make heterogeneity and overall p-values scientific notation
+       
+       col.square = "darkgreen", # colour of cohort effects
+       col.diamond = "black", # colour of overall effect
+       
+       print.byvar = FALSE # removes "Group = " from header of subgroups
+)
+dev.off()
+```
